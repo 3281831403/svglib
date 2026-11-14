@@ -1,10 +1,22 @@
 """Text nodes: whitespace, fonts, baseline shifts and tspans."""
 
+import pytest
 from reportlab.lib import colors
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from tests.utils import (
     drawing_from_svg,
 )
+
+
+def rendered_span(string):
+    """The left and right edge a String gets when rendered."""
+    width = stringWidth(string.text, string.fontName, string.fontSize)
+    if string.textAnchor == "middle":
+        return string.x - width / 2, string.x + width / 2
+    if string.textAnchor == "end":
+        return string.x - width, string.x
+    return string.x, string.x + width
 
 
 class TestTextNode:
@@ -225,3 +237,216 @@ class TestTextNode:
         assert main_group.contents[0].contents[7].y == -20 - (1.5 * 28)
         assert main_group.contents[0].contents[7].text == "Complete"
         assert main_group.contents[0].contents[8].text == " The end"
+
+
+class TestLetterSpacing:
+    def test_attribute_number(self):
+        """A bare letter-spacing number spaces the characters out, one String
+        per character, with no spacing after the last character."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <text x="10" y="50" font-size="20" letter-spacing="2">ABC</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["A", "B", "C"]
+        wa, wb, wc = (stringWidth(c, "Helvetica", 20) for c in "ABC")
+        assert [s.x for s in strings] == pytest.approx(
+            [10, 10 + wa + 2, 10 + wa + wb + 4]
+        )
+        # The spacing only goes between characters: the right edge of the
+        # last one is the start plus the bare width plus two spacings.
+        right = strings[-1].x + wc
+        assert right == pytest.approx(10 + stringWidth("ABC", "Helvetica", 20) + 4)
+
+    def test_style_class_and_px(self):
+        """letter-spacing works from a <style> class rule and with px units."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <style>.wide { letter-spacing: 3px }</style>
+              <text x="10" y="50" font-size="20" class="wide">AB</text>
+              <text x="10" y="80" font-size="20"
+                    style="letter-spacing: 1px">CD</text>
+            </svg>
+        """
+        )
+        first, second = drawing.contents[0].contents
+        wa = stringWidth("A", "Helvetica", 20)
+        wc = stringWidth("C", "Helvetica", 20)
+        assert [s.text for s in first.contents] == ["A", "B"]
+        assert first.contents[1].x == pytest.approx(10 + wa + 3)
+        assert [s.text for s in second.contents] == ["C", "D"]
+        assert second.contents[1].x == pytest.approx(10 + wc + 1)
+
+    def test_inherited_and_em(self):
+        """letter-spacing is inherited; em resolves against the font size of
+        the element the value is found on."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <g letter-spacing="0.5em" font-size="20">
+                <text x="10" y="50">AB</text>
+                <text x="10" y="80" font-size="40">CD</text>
+              </g>
+              <text x="10" y="110" font-size="20"
+                    letter-spacing="0.5em">EF</text>
+            </svg>
+        """
+        )
+        group = drawing.contents[0].contents[0]
+        inherited, own_size, direct = (
+            group.contents[0],
+            group.contents[1],
+            drawing.contents[0].contents[1],
+        )
+        # 0.5em of the <g> font size (20) = 10, also for the 40px text.
+        assert inherited.contents[1].x == pytest.approx(
+            10 + stringWidth("A", "Helvetica", 20) + 10
+        )
+        assert own_size.contents[1].x == pytest.approx(
+            10 + stringWidth("C", "Helvetica", 40) + 10
+        )
+        # 0.5em of the element's own font size (20) = 10.
+        assert direct.contents[1].x == pytest.approx(
+            10 + stringWidth("E", "Helvetica", 20) + 10
+        )
+
+    def test_tspan_overrides_and_tail_text(self):
+        """Each fragment uses its own resolved spacing; tail text continues
+        the chunk with the spacing of the <text> element."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <text x="10" y="50" font-size="20" letter-spacing="1"
+                >A<tspan letter-spacing="3">BC</tspan>D</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["A", "B", "C", "D"]
+        wa, wb, wc, _ = (stringWidth(c, "Helvetica", 20) for c in "ABCD")
+        assert [s.x for s in strings] == pytest.approx(
+            [10, 10 + wa + 1, 10 + wa + wb + 4, 10 + wa + wb + wc + 7]
+        )
+
+    def test_no_letter_spacing_keeps_single_strings(self):
+        """Without letter-spacing the output is exactly as before: one String
+        per fragment, positioned by cumulative bare widths."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <text x="10" y="50" font-size="20">AB<tspan>CD</tspan></text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["AB", "CD"]
+        assert strings[0].x == 10
+        assert strings[1].x == 10 + stringWidth("AB", "Helvetica", 20)
+
+    def test_anchor_middle_with_letter_spacing(self):
+        """A centered chunk is aligned by its total width, spacing included,
+        with no spacing after the last character."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <text x="100" y="50" font-size="20" letter-spacing="2"
+                    text-anchor="middle">ABC</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        total = stringWidth("ABC", "Helvetica", 20) + 2 * 2
+        left, right = rendered_span(strings[0])[0], rendered_span(strings[-1])[1]
+        assert left == pytest.approx(100 - total / 2)
+        assert right == pytest.approx(100 + total / 2)
+
+    def test_anchor_end_with_letter_spacing_and_tspan(self):
+        """A right-aligned chunk ends at the anchor, tspans and tail text
+        included; the last character carries no trailing spacing."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <text x="100" y="50" font-size="20" letter-spacing="2"
+                    text-anchor="end">AB<tspan>CD</tspan>EF</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == list("ABCDEF")
+        total = stringWidth("ABCDEF", "Helvetica", 20) + 2 * 5
+        left, right = rendered_span(strings[0])[0], rendered_span(strings[-1])[1]
+        assert left == pytest.approx(100 - total)
+        assert right == pytest.approx(100)
+
+
+class TestTextAnchorChunks:
+    def test_tspans_align_as_one_chunk(self):
+        """Centered and right-aligned text with tspans is aligned by the
+        total width of all fragments, not fragment by fragment."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+              <text x="100" y="50" font-size="20"
+                    text-anchor="middle">AB<tspan>CD</tspan>EF</text>
+              <text x="300" y="50" font-size="20"
+                    text-anchor="end">AB<tspan>CD</tspan>EF</text>
+            </svg>
+        """
+        )
+        middle, end = drawing.contents[0].contents
+        total = stringWidth("ABCDEF", "Helvetica", 20)
+        left = min(rendered_span(s)[0] for s in middle.contents)
+        right = max(rendered_span(s)[1] for s in middle.contents)
+        assert left == pytest.approx(100 - total / 2)
+        assert right == pytest.approx(100 + total / 2)
+        left = min(rendered_span(s)[0] for s in end.contents)
+        right = max(rendered_span(s)[1] for s in end.contents)
+        assert left == pytest.approx(300 - total)
+        assert right == pytest.approx(300)
+
+    def test_tspan_with_x_starts_new_chunk(self):
+        """A tspan with its own x starts a new chunk, aligned by its own
+        text-anchor, while the first chunk keeps the <text> anchor."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+              <text x="100" y="50" font-size="20" text-anchor="middle"
+                >AB<tspan x="200" text-anchor="end">CD</tspan><tspan
+                    x="300">EF</tspan></text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["AB", "CD", "EF"]
+        wab, wcd, wef = (stringWidth(t, "Helvetica", 20) for t in ("AB", "CD", "EF"))
+        # First chunk centered on 100.
+        assert rendered_span(strings[0]) == pytest.approx(
+            (100 - wab / 2, 100 + wab / 2)
+        )
+        # Second chunk right-aligned on its own x, by its own anchor.
+        assert rendered_span(strings[1]) == pytest.approx((200 - wcd, 200))
+        # Third chunk inherits "middle" from the <text> element.
+        assert rendered_span(strings[2]) == pytest.approx(
+            (300 - wef / 2, 300 + wef / 2)
+        )
+
+    def test_single_fragment_anchor_is_left_to_reportlab(self):
+        """A single-run text keeps its x and textAnchor untouched, so old
+        documents render exactly as before."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+              <text x="100" y="50" font-size="20" text-anchor="middle">ABC</text>
+              <text x="100" y="80" font-size="20" text-anchor="end">DEF</text>
+            </svg>
+        """
+        )
+        middle, end = drawing.contents[0].contents
+        assert middle.contents[0].x == 100
+        assert middle.contents[0].textAnchor == "middle"
+        assert end.contents[0].x == 100
+        assert end.contents[0].textAnchor == "end"

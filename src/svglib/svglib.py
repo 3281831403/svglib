@@ -864,6 +864,31 @@ class Svg2RlgAttributeConverter(AttributeConverter):
             svgNode = svgNode.parent
         return opacity
 
+    def findLetterSpacing(self, svgNode: Any) -> float:
+        """Return the letter spacing of a node, in user units (0 when unset).
+
+        'letter-spacing' is inherited, so the node's ancestors are searched,
+        as for 'findAttr'. A relative value such as 'em' is resolved against
+        the font size of the element the value is found on, as in CSS.
+        """
+        node = svgNode
+        value = ""
+        while node is not None:
+            self._applyStyleRules(node)
+            value = node.attrib.get("letter-spacing", "").strip()
+            if value and value != "inherit":
+                break
+            node = node.parent
+        if not value or value in ("inherit", "normal"):
+            return 0.0
+        try:
+            return cast(
+                float, self.convertLength(value, em_base=self.findFontSize(node))
+            )
+        except ValueError:
+            logger.debug("Ignoring invalid letter-spacing: %s", value)
+            return 0.0
+
     def convertOpacity(self, svgAttr: str) -> float:
         """Convert an opacity string (number or percentage) to a float in [0, 1]."""
         if isinstance(svgAttr, str) and svgAttr.endswith("%"):
@@ -2515,8 +2540,49 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
         x: list[float]
         y: list[float]
         x, y = self.convert_length_attrs(node, "x", "y", em_base=fs)  # type: ignore
+
+        # The fragments of the current text chunk, buffered so that
+        # text-anchor can align the whole chunk once its total width is
+        # known. A tspan with its own x starts a new chunk, anchored by its
+        # own text-anchor; tspans and tail text without x continue the chunk.
+        chunk: list[dict[str, Any]] = []
+
+        def flush_chunk() -> None:
+            if not chunk:
+                return
+            anchor = attrConv.findAttr(chunk[0]["subnode"], "text-anchor") or "start"
+            shapes = [shape for frag in chunk for shape in frag["shapes"]]
+            if any(frag["letter_spacing"] for frag in chunk):
+                # ReportLab knows nothing of the letter spacing, so every
+                # shape is anchored "start" and the chunk aligned by hand.
+                width = sum(frag["advance"] for frag in chunk)
+                # No spacing after the last character of the chunk.
+                width -= chunk[-1]["letter_spacing"]
+                offset = {"middle": -width / 2, "end": -width}.get(anchor, 0)
+                for shape in shapes:
+                    shape.textAnchor = "start"
+                    shape.x += offset
+            elif anchor in ("middle", "end"):
+                # ReportLab anchors each String by its own width; shift each
+                # so that the chunk as a whole is aligned on the anchor.
+                width = sum(
+                    stringWidth(shape.text, shape.fontName, shape.fontSize)
+                    for shape in shapes
+                )
+                chunk_offset = -width / 2 if anchor == "middle" else -width
+                for shape in shapes:
+                    own_width = stringWidth(shape.text, shape.fontName, shape.fontSize)
+                    own_offset = {"middle": -own_width / 2, "end": -own_width}.get(
+                        shape.textAnchor, 0
+                    )
+                    shape.x += chunk_offset - own_offset
+            for shape in shapes:
+                gr.add(shape)
+            chunk.clear()
+
         for subnode, text, is_tail in iter_text_node(node, preserve_space):
             if not is_tail and node_name(subnode) == "textPath":
+                flush_chunk()
                 gr.add(self.convertTextPath(subnode, node, preserve_space))
             if _is_inside_text_path(subnode, node):
                 continue
@@ -2567,12 +2633,12 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
                     float, attrConv.convertLength(baseLineShift_raw, em_base=fs)
                 )
 
-            # User units, like the x coordinates these widths are added to.
-            frag_lengths.append(stringWidth(text, ff, fs))
-
             # When x, y, dx, or dy is a list, we calculate position for each char of
-            # text.
+            # text. Letter spacing does not apply to these per-character lists.
             if any(isinstance(val, list) for val in (x1, y1, dx, dy)):
+                flush_chunk()
+                # User units, like the x coordinates these widths are added to.
+                frag_lengths.append(stringWidth(text, ff, fs))
                 if has_x:
                     xlist = x1 if isinstance(x1, list) else [x1]
                 else:
@@ -2607,14 +2673,49 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
                     last_x = new_x
                     last_y = new_y
                     last_char = char
+                continue
+
+            letter_spacing = attrConv.findLetterSpacing(subnode)
+            # User units, like the x coordinates these widths are added to.
+            # The spacing follows every character, so it also separates the
+            # last character of a fragment from the first of the next one.
+            advance = stringWidth(text, ff, fs) + letter_spacing * len(text)
+            frag_lengths.append(advance)
+
+            new_x = (x1 + dx) if has_x else (x + dx0 + sum(frag_lengths[:-1]))  # type: ignore
+            new_y = (y1 + dy) if has_y else (y + dy0)  # type: ignore
+            if has_x:
+                # An absolute x starts a new text chunk.
+                flush_chunk()
+            shapes: list[Any] = []
+            if letter_spacing:
+                # ReportLab cannot space out the characters of a String, so
+                # each character gets its own, positioned String.
+                char_x = new_x
+                for char in text:
+                    shape = String(char_x, -(new_y - baseLineShift), char)  # type: ignore
+                    self.applyStyleOnShape(shape, node)
+                    if node_name(subnode) == "tspan":
+                        self.applyStyleOnShape(shape, subnode)
+                    shape.textAnchor = "start"
+                    shapes.append(shape)
+                    char_x += stringWidth(char, ff, fs) + letter_spacing
             else:
-                new_x = (x1 + dx) if has_x else (x + dx0 + sum(frag_lengths[:-1]))  # type: ignore
-                new_y = (y1 + dy) if has_y else (y + dy0)  # type: ignore
                 shape = String(new_x, -(new_y - baseLineShift), text)  # type: ignore
                 self.applyStyleOnShape(shape, node)
                 if node_name(subnode) == "tspan":
                     self.applyStyleOnShape(shape, subnode)
-                gr.add(shape)
+                shapes.append(shape)
+            chunk.append(
+                {
+                    "subnode": subnode,
+                    "advance": advance,
+                    "letter_spacing": letter_spacing,
+                    "shapes": shapes,
+                }
+            )
+
+        flush_chunk()
 
         gr.scale(1, -1)
 

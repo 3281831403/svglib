@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- `letter-spacing` is now supported on `<text>` and `<tspan>`, as a
+  presentation attribute, in `style` attributes and in `<style>` rules, and
+  inherited from ancestor elements. Bare numbers and `px` are user units and
+  `em` resolves against the font size of the element the value is found on.
+  The spacing only goes between adjacent characters, never after the last
+  one. ReportLab cannot space out the characters of a string, so spaced text
+  is drawn as one positioned string per character.
+
+### Fixed
+
+- `text-anchor` now aligns a whole text chunk — the `<text>` content, its
+  `<tspan>` children and their tail text — by the total width of the chunk,
+  letter spacing included, instead of aligning each fragment by its own
+  width, which pushed multi-fragment centered and right-aligned text off the
+  anchor. A `<tspan>` with its own `x` starts a new chunk, aligned by its own
+  `text-anchor`.
+
 ### Tooling and housekeeping
 
 - CI runs PyPy 3.11 on Ubuntu 24.04 instead of `ubuntu-latest`, which is Ubuntu
