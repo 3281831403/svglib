@@ -1,6 +1,7 @@
 """Text nodes: whitespace, fonts, baseline shifts and tspans."""
 
 from reportlab.lib import colors
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from tests.utils import (
     drawing_from_svg,
@@ -225,3 +226,70 @@ class TestTextNode:
         assert main_group.contents[0].contents[7].y == -20 - (1.5 * 28)
         assert main_group.contents[0].contents[7].text == "Complete"
         assert main_group.contents[0].contents[8].text == " The end"
+
+    def test_tspan_font_change_shifts_following_text(self):
+        """Text after a resized <tspan> starts after it, not on top of it."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+              <text x="10" y="50" font-size="10">ab<tspan font-size="40">CD</tspan>ef</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["ab", "CD", "ef"]
+        big_width = stringWidth("CD", strings[1].fontName, 40)
+        assert strings[2].x == strings[1].x + big_width
+
+    def test_tspan_dx_dy_list_is_applied_once(self):
+        """A dx/dy list shifts the first character a single time."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+              <text x="10" y="20" font-size="10"><tspan dx="5 5 5" dy="2 2 2">abc</tspan></text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["a", "b", "c"]
+        assert strings[0].x == 15
+        assert strings[0].y == -22
+        char_width = stringWidth("a", strings[0].fontName, 10)
+        assert strings[1].x == 15 + char_width + 5
+        assert strings[1].y == -24
+
+    def test_text_anchor_middle_centers_whole_chunk(self):
+        """text-anchor centers a whole line, not every tspan on its own."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+              <text x="100" y="50" text-anchor="middle" font-size="10">hello
+                <tspan>wide</tspan> world</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        total = sum(stringWidth(s.text, s.fontName, s.fontSize) for s in strings)
+        left, right = strings[0].x, strings[-1].x + stringWidth(
+            strings[-1].text, strings[-1].fontName, strings[-1].fontSize
+        )
+        assert abs((left + right) / 2 - 100) < 1e-9
+        assert abs(right - left - total) < 1e-9
+        # Anchoring is done by svglib, the Strings must not be anchored again.
+        assert all(s.textAnchor == "start" for s in strings)
+
+    def test_text_after_absolute_tspan_continues_on_same_line(self):
+        """An absolute x/y <tspan> moves the current text position for good."""
+        drawing = drawing_from_svg(
+            """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+              <text x="10" y="20" font-size="10">first line
+                <tspan x="10" y="40">second</tspan> rest</text>
+            </svg>
+        """
+        )
+        strings = drawing.contents[0].contents[0].contents
+        assert [s.text for s in strings] == ["first line ", "second", " rest"]
+        second, rest = strings[1], strings[2]
+        assert rest.y == second.y == -40
+        assert rest.x == second.x + stringWidth("second", second.fontName, 10)

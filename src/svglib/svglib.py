@@ -2515,20 +2515,32 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
 
         gr = Group()
 
-        frag_lengths: list[float] = []
-
-        dx0: float = 0
-        dy0: float = 0
         x1: Union[float, list[float]] = 0
         y1: Union[float, list[float]] = 0
-        ff = attrConv.findAttr(node, "font-family") or DEFAULT_FONT_NAME
-        fw = attrConv.findAttr(node, "font-weight") or DEFAULT_FONT_WEIGHT
-        fstyle = attrConv.findAttr(node, "font-style") or DEFAULT_FONT_STYLE
-        ff = attrConv.convertFontFamily(ff, fw, fstyle)
-        fs = attrConv.findFontSize(node)  # user units, em_base
-        x: list[float]
-        y: list[float]
-        x, y = self.convert_length_attrs(node, "x", "y", em_base=fs)  # type: ignore
+        fs0 = attrConv.findFontSize(node)  # user units, em_base
+        x, y = self.convert_length_attrs(node, "x", "y", em_base=fs0)
+        # Current text position in user units: a fragment without absolute
+        # x/y of its own continues right where the previous fragment ended,
+        # including any dx/dy shifts and absolute re-positioning done so far.
+        cur_x = x[0] if isinstance(x, list) else x
+        cur_y = y[0] if isinstance(y, list) else y
+
+        # text-anchor applies to a whole text chunk (a run of fragments
+        # between absolute x positions), not to every String on its own, so
+        # the chunks are collected and shifted once fully laid out.
+        anchor = attrConv.findAttr(node, "text-anchor")
+        chunks: list[dict[str, Any]] = []
+
+        def add_string(
+            shape: Any, x_begin: float, x_end: float, new_chunk: bool
+        ) -> None:
+            if new_chunk or not chunks:
+                chunks.append({"shapes": [], "start": x_begin, "end": x_end})
+            chunk = chunks[-1]
+            chunk["shapes"].append(shape)
+            chunk["end"] = x_end
+            gr.add(shape)
+
         for subnode, text, is_tail in iter_text_node(node, preserve_space):
             if not is_tail and node_name(subnode) == "textPath":
                 gr.add(self.convertTextPath(subnode, node, preserve_space))
@@ -2540,6 +2552,13 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
             dx: Union[float, list[float]] = 0
             dy: Union[float, list[float]] = 0
             baseLineShift: Union[float, int] = 0
+            # Every fragment is measured with its own font: a <tspan> may
+            # change the family, size, weight or style for its text only.
+            ff = attrConv.findAttr(subnode, "font-family") or DEFAULT_FONT_NAME
+            fw = attrConv.findAttr(subnode, "font-weight") or DEFAULT_FONT_WEIGHT
+            fstyle = attrConv.findAttr(subnode, "font-style") or DEFAULT_FONT_STYLE
+            ff = attrConv.convertFontFamily(ff, fw, fstyle)
+            fs = attrConv.findFontSize(subnode)  # user units, em_base
             if not is_tail:
                 x1, y1, dx, dy = self.convert_length_attrs(
                     subnode,
@@ -2553,8 +2572,6 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
                     subnode.attrib.get("x", "") != "",
                     subnode.attrib.get("y", "") != "",
                 )
-                dx0 += dx[0] if isinstance(dx, list) else dx
-                dy0 += dy[0] if isinstance(dy, list) else dy
             # baseline-shift is not inherited, so a value on an enclosing <g> must
             # not move the text. Look no further than the <text> element: text in a
             # nested <tspan> still sits on the shifted baseline of the one around it.
@@ -2582,7 +2599,7 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
                 )
 
             # User units, like the x coordinates these widths are added to.
-            frag_lengths.append(stringWidth(text, ff, fs))
+            frag_width = stringWidth(text, ff, fs)
 
             # When x, y, dx, or dy is a list, we calculate position for each char of
             # text.
@@ -2590,14 +2607,15 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
                 if has_x:
                     xlist = x1 if isinstance(x1, list) else [x1]
                 else:
-                    xlist = [x + dx0 + sum(frag_lengths[:-1])]  # type: ignore
+                    xlist = [cur_x]
                 if has_y:
                     ylist = y1 if isinstance(y1, list) else [y1]
                 else:
-                    ylist = [y + dy0]  # type: ignore
+                    ylist = [cur_y]
                 dxlist = dx if isinstance(dx, list) else [dx]
                 dylist = dy if isinstance(dy, list) else [dy]
                 last_x, last_y, last_char = xlist[0], ylist[0], ""
+                new_chunk = has_x
                 for char_x, char_y, char_dx, char_dy, char in itertools.zip_longest(
                     xlist, ylist, dxlist, dylist, text
                 ):
@@ -2617,18 +2635,38 @@ class Svg2RlgShapeConverter(SvgShapeConverter):
                     self.applyStyleOnShape(shape, node)
                     if node_name(subnode) == "tspan":
                         self.applyStyleOnShape(shape, subnode)
-                    gr.add(shape)
+                    add_string(
+                        shape, new_x, new_x + stringWidth(char, ff, fs), new_chunk
+                    )
+                    new_chunk = False
                     last_x = new_x
                     last_y = new_y
                     last_char = char
+                cur_x = last_x + stringWidth(last_char, ff, fs)
+                cur_y = last_y
             else:
-                new_x = (x1 + dx) if has_x else (x + dx0 + sum(frag_lengths[:-1]))  # type: ignore
-                new_y = (y1 + dy) if has_y else (y + dy0)  # type: ignore
-                shape = String(new_x, -(new_y - baseLineShift), text)  # type: ignore
+                # No list-valued attributes: scalar positions only.
+                sx1, sdx = cast(float, x1), cast(float, dx)
+                sy1, sdy = cast(float, y1), cast(float, dy)
+                new_x = (sx1 + sdx) if has_x else (cur_x + sdx)
+                new_y = (sy1 + sdy) if has_y else (cur_y + sdy)
+                shape = String(new_x, -(new_y - baseLineShift), text)
                 self.applyStyleOnShape(shape, node)
                 if node_name(subnode) == "tspan":
                     self.applyStyleOnShape(shape, subnode)
-                gr.add(shape)
+                add_string(shape, new_x, new_x + frag_width, has_x)
+                cur_x = new_x + frag_width
+                cur_y = new_y
+
+        if anchor in ("middle", "end"):
+            for chunk in chunks:
+                width = chunk["end"] - chunk["start"]
+                shift = width / 2 if anchor == "middle" else width
+                for shape in chunk["shapes"]:
+                    shape.x -= shift
+                    if shape.textAnchor == anchor:
+                        # Anchoring is done above, for the chunk as a whole.
+                        shape.textAnchor = "start"
 
         gr.scale(1, -1)
 
